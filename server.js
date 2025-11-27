@@ -95,6 +95,16 @@ async function ensureSchema() {
     )
   `)
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id SERIAL PRIMARY KEY,
+      sender TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
+
   const seedUsers = [
     { email: 'admin@hrive.com', password: 'admin123', role: 'admin' },
     { email: 'hr@hrive.com', password: 'hr12345', role: 'hr' },
@@ -197,6 +207,125 @@ app.get('/api/portal/:portalId/:section', (req, res) => {
   const { section } = req.params
   const data = lists[section] ?? []
   res.json({ section, items: data })
+})
+
+app.get('/api/chat/history', async (req, res) => {
+  const { userA, userB } = req.query || {}
+  if (!userA || !userB) return res.status(400).json({ error: 'userA and userB are required' })
+  try {
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('chat_messages')
+        .select('*')
+        .or(`and(sender.eq.${userA},recipient.eq.${userB}),and(sender.eq.${userB},recipient.eq.${userA})`)
+        .order('created_at', { ascending: true })
+      if (error) return res.status(500).json({ error: 'DB error', detail: error.message })
+      return res.json({ messages: data ?? [] })
+    }
+
+    const result = await pool.query(
+      `
+        SELECT id, sender, recipient, body, created_at
+        FROM chat_messages
+        WHERE (sender = $1 AND recipient = $2) OR (sender = $2 AND recipient = $1)
+        ORDER BY created_at ASC
+      `,
+      [userA, userB],
+    )
+    res.json({ messages: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: 'Unexpected error', detail: err.message })
+  }
+})
+
+app.get('/api/chat/contacts', async (req, res) => {
+  const { user } = req.query || {}
+  if (!user) return res.status(400).json({ error: 'user is required' })
+  try {
+    if (supabase) {
+      const { data, error } = await supabase.from('chat_messages').select('sender, recipient')
+      if (error) return res.status(500).json({ error: 'DB error', detail: error.message })
+      const set = new Set()
+      for (const row of data || []) {
+        if (row.sender !== user) set.add(row.sender)
+        if (row.recipient !== user) set.add(row.recipient)
+      }
+      return res.json({ contacts: Array.from(set) })
+    }
+
+    const result = await pool.query('SELECT sender, recipient FROM chat_messages')
+    const set = new Set()
+    for (const row of result.rows) {
+      if (row.sender !== user) set.add(row.sender)
+      if (row.recipient !== user) set.add(row.recipient)
+    }
+    res.json({ contacts: Array.from(set) })
+  } catch (err) {
+    res.status(500).json({ error: 'Unexpected error', detail: err.message })
+  }
+})
+
+function buildAskHRAnswer({ question = '', user = '' }) {
+  const q = String(question).toLowerCase()
+  const salaries = {
+    'admin@hrive.com': '$120,000',
+    'hr@hrive.com': '$95,000',
+    'manager@hrive.com': '$105,000',
+    'employee@hrive.com': '$70,000',
+  }
+  const leave = 'You have 14 days of annual leave remaining. Carry-over allowed up to 5 days.'
+  const payroll = 'Payroll runs on the 25th each month; payslips are published the same day.'
+  const benefits = 'Medical, dental, vision, 401k match 4%, learning budget $1,500/year.'
+  const contact = 'You can reach HR at hr@hrive.com or Slack #ask-hr.'
+  if (q.includes('salary') || q.includes('pay') || q.includes('comp')) {
+    const key = Object.keys(salaries).find((k) => user && user.toLowerCase() === k) ?? 'employee@hrive.com'
+    return `Your current salary on file: ${salaries[key]} (CTC). For updates, contact HR comp team.`
+  }
+  if (q.includes('leave') || q.includes('vacation') || q.includes('pto')) return leave
+  if (q.includes('payroll') || q.includes('payslip') || q.includes('pay day')) return payroll
+  if (q.includes('benefit') || q.includes('insurance') || q.includes('401')) return benefits
+  if (q.includes('manager') || q.includes('supervisor')) return 'Your manager on file: Alex Manager (alex.manager@hrive.com).'
+  if (q.includes('policy') || q.includes('handbook')) return 'Policies live at https://intranet/policies. Key docs: leave, expense, security.'
+  if (q.includes('help') || q.includes('contact') || q.includes('reach')) return contact
+  return 'I logged your question for HR. For quick help, ask about salary, leave balance, payroll dates, benefits, or manager info.'
+}
+
+app.post('/api/ask-hr', async (req, res) => {
+  const { user, question } = req.body || {}
+  if (!question) return res.status(400).json({ error: 'question is required' })
+  try {
+    const answer = buildAskHRAnswer({ question, user })
+    res.json({ answer })
+  } catch (err) {
+    res.status(500).json({ error: 'Unexpected error', detail: err.message })
+  }
+})
+
+app.post('/api/chat/send', async (req, res) => {
+  const { sender, recipient, body } = req.body || {}
+  if (!sender || !recipient || !body || !String(body).trim()) {
+    return res.status(400).json({ error: 'sender, recipient, and body are required' })
+  }
+  const text = String(body).trim()
+  try {
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('chat_messages')
+        .insert([{ sender, recipient, body: text }])
+        .select('*')
+        .single()
+      if (error) return res.status(500).json({ error: 'DB error', detail: error.message })
+      return res.status(201).json(data)
+    }
+
+    const result = await pool.query(
+      'INSERT INTO chat_messages (sender, recipient, body) VALUES ($1, $2, $3) RETURNING id, sender, recipient, body, created_at',
+      [sender, recipient, text],
+    )
+    res.status(201).json(result.rows[0])
+  } catch (err) {
+    res.status(500).json({ error: 'Unexpected error', detail: err.message })
+  }
 })
 
 app.get('/api/health', (req, res) => res.json({ ok: true }))
